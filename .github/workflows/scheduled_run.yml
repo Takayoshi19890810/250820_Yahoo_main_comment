@@ -1,4 +1,4 @@
-name: Scrape Yahoo article bodies & comments
+name: Yahoo News: Transfer A-E then scrape article bodies & comments
 
 on:
   schedule:
@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ✅ Google Chrome だけ入れる（Chromedriverは不要）
+      # ✅ Google Chrome だけ入れる（Chromedriverは不要：Selenium Managerが自動解決）
       - name: 🧰 Install Google Chrome
         run: |
           sudo apt-get update
@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: ▶️ Run scraper
+      - name: ▶️ Run unified job
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: |
