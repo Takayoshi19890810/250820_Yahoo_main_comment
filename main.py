@@ -12,7 +12,6 @@ F列以降に本文（最大10ページ）、P列にコメント数、Q列以降
 - 本文は最大10ページ分を F..O 列へ (本文(1ページ) ～ 本文(10ページ))
 - コメント数を P 列へ
 - コメント本文を Q 列以降に横並びで格納（コメント1, コメント2, ...）
-- 既存行順（URLの並び順）に対応して同じ行番号へ書き込み
 """
 
 import os
@@ -30,16 +29,14 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 # ===== 設定 =====
-SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"  # 出力先シート（固定）
-SHEET_NAME = datetime.now(timezone(timedelta(hours=9))).strftime("%y%m%d")  # JSTで当日タブ
-MAX_BODY_PAGES = 10        # 本文ページ最大
-MAX_COMMENT_PAGES = 10     # コメントページ最大
-
+SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"  # 出力先シート
+SHEET_NAME = datetime.now(timezone(timedelta(hours=9))).strftime("%y%m%d")  # 当日タブ
+MAX_BODY_PAGES = 10
+MAX_COMMENT_PAGES = 10
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ===== 認証 =====
 def build_gspread_client() -> gspread.Client:
-    """GOOGLE_CREDENTIALS(文字列) または credentials.json から認証"""
     try:
         creds_str = os.environ.get("GOOGLE_CREDENTIALS")
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -54,27 +51,23 @@ def build_gspread_client() -> gspread.Client:
     except Exception as e:
         raise RuntimeError(f"Google認証に失敗: {e}")
 
-# ===== ユーティリティ =====
+# ===== ヘッダ管理 =====
 def ensure_sheet_and_headers(ws: gspread.Worksheet, max_comments: int) -> None:
-    """1行目にヘッダーを整備（本文列、コメント数、コメント列）"""
     values = ws.get('A1:Z1')
     header = values[0] if values else []
-
     required = ["ソース","タイトル","URL","投稿日","掲載元"]
-    body_headers = [f"本文({i}ページ)" for i in range(1, 11)]  # F..O
-    comments_count_header = ["コメント数"]                       # P
-    comment_headers = [f"コメント{i}" for i in range(1, max(1, max_comments) + 1)]  # Q..
-
+    body_headers = [f"本文({i}ページ)" for i in range(1, 11)]
+    comments_count_header = ["コメント数"]
+    comment_headers = [f"コメント{i}" for i in range(1, max(1, max_comments) + 1)]
     target_header = required + body_headers + comments_count_header + comment_headers
     if header != target_header:
         ws.update('A1', [target_header])
 
+# ===== 本文取得 =====
 def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
-    """記事本文（複数ページ対応）を取得"""
     title = "取得不可"
     article_date = "取得不可"
     bodies: List[str] = []
-
     for page in range(1, MAX_BODY_PAGES + 1):
         url = base_url if page == 1 else f"{base_url}?page={page}"
         try:
@@ -82,9 +75,7 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
             res.raise_for_status()
         except Exception:
             break
-
         soup = BeautifulSoup(res.text, "html.parser")
-
         if page == 1:
             t = soup.find("title")
             if t and t.get_text(strip=True):
@@ -92,7 +83,6 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
             time_tag = soup.find("time")
             if time_tag:
                 article_date = time_tag.get_text(strip=True)
-
         body_text = ""
         article = soup.find("article")
         if article:
@@ -103,75 +93,63 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
             if main:
                 ps = main.find_all("p")
                 body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
-
         if not body_text or (bodies and body_text == bodies[-1]):
             break
-
         bodies.append(body_text)
-
     return title, article_date, bodies
 
+# ===== コメント取得 =====
 def fetch_comments_with_selenium(base_url: str) -> List[str]:
-    """コメント本文をSeleniumで取得"""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-
-    driver = webdriver.Chrome(options=options)
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,2000")
+    driver = webdriver.Chrome(options=options)  # ✅ Selenium Manager が自動解決
     comments: List[str] = []
-
     try:
         for page in range(1, MAX_COMMENT_PAGES + 1):
             c_url = f"{base_url}/comments?page={page}"
             driver.get(c_url)
             time.sleep(2)
-
             soup = BeautifulSoup(driver.page_source, "html.parser")
             p_candidates = []
             p_candidates.extend(soup.find_all("p", class_="sc-169yn8p-10"))
             p_candidates.extend(soup.select("p[data-ylk*='cm_body']"))
             p_candidates.extend(soup.select("p[class*='comment']"))
             page_comments = [p.get_text(strip=True) for p in p_candidates if p.get_text(strip=True)]
-
             if not page_comments:
                 break
             if comments and page_comments and page_comments[0] == comments[-1]:
                 break
-
             comments.extend(page_comments)
     finally:
         driver.quit()
-
     return comments
 
+# ===== メイン処理 =====
 def main():
     print(f"📄 Spreadsheet: {SPREADSHEET_ID}")
     print(f"📑 Sheet: {SHEET_NAME}")
-
     gc = build_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
     try:
         ws = sh.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SHEET_NAME, rows="2000", cols="200")
-
     urls = ws.col_values(3)[1:]
     total = len(urls)
     print(f"🔎 URLs to process: {total}")
     if total == 0:
-        print("URLがありません。終了します。")
         return
-
     rows_data: List[List[str]] = []
     max_comments = 0
-
     for idx, url in enumerate(urls, start=2):
         try:
             print(f"  - ({idx-1}/{total}) {url}")
             title, article_date, bodies = fetch_article_pages(url)
             comments = fetch_comments_with_selenium(url)
-
             body_cells = bodies[:MAX_BODY_PAGES] + [""] * (MAX_BODY_PAGES - len(bodies))
             comment_count = len(comments)
             row = body_cells + [comment_count] + comments
@@ -182,12 +160,10 @@ def main():
             print(f"    ! Error: {e}")
             row = ([""] * MAX_BODY_PAGES) + [0]
             rows_data.append(row)
-
     need_cols = MAX_BODY_PAGES + 1 + max_comments
     for i in range(len(rows_data)):
         if len(rows_data[i]) < need_cols:
             rows_data[i].extend([""] * (need_cols - len(rows_data[i])))
-
     ensure_sheet_and_headers(ws, max_comments=max_comments)
     ws.update("F2", rows_data)
     print(f"✅ 書き込み完了: {len(rows_data)}行 / コメント列={max_comments}")
