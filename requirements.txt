@@ -1,0 +1,13 @@
+# Google Sheets API
+google-api-python-client==2.137.0
+google-auth==2.33.0
+google-auth-httplib2==0.2.0
+
+# データ処理（将来拡張向け・最低限）
+pandas==2.2.3
+numpy==2.1.0
+
+# リクエスト
+requests==2.32.3
+urllib3==2.2.2
+tqdm==4.66.5
