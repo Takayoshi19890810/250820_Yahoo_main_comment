@@ -2,7 +2,7 @@ name: Run Yahoo News Transfer (5 columns)
 
 on:
   schedule:
-    # 毎日15:00 JST = 06:00 UTC
+    # 毎日15:00 JST（= 06:00 UTC）に実行
     - cron: '0 6 * * *'
   workflow_dispatch:
 
