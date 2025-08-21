@@ -1,222 +1,196 @@
 # -*- coding: utf-8 -*-
 """
-コピー元スプレッドシートの 'Yahoo' シート（A:タイトル, B:URL, C:投稿日, D:掲載元）から
-JSTの「前日15:00〜当日14:59:59」に入るデータのみを抽出し、
-出力先スプレッドシートの当日タブ（yyMMdd）へ
-【ソース / タイトル / URL / 投稿日 / 掲載元】の5列で追記します。
+当日タブ（例: yyMMdd）にあるURL（C列）をもとに、
+F列以降に本文（最大10ページ）、P列にコメント数、Q列以降にコメント本文を追記する。
+
+前提:
+- A:ソース / B:タイトル / C:URL / D:投稿日 / E:掲載元 は既に存在（main.py等で作成済み）
+- 当日タブ名は JST の yyMMdd
+- 認証は GOOGLE_CREDENTIALS(サービスアカウントJSONの中身) または credentials.json
 
 仕様:
-- ソース列は固定で "Yahoo"
-- 出力タブが無ければ自動作成
-- 同一URLは当日タブ内で重複スキップ
-- 投稿日は表示書式「yy/m/d HH:MM」（例: 25/8/21 15:01）
-- 認証は環境変数 GOOGLE_CREDENTIALS（サービスアカウントJSONの中身）を使用
+- 本文は最大10ページ分を F..O 列へ (本文(1ページ) ～ 本文(10ページ))
+- コメント数を P 列へ
+- コメント本文を Q 列以降に横並びで格納（コメント1, コメント2, ...）
+- 既存行順（URLの並び順）に対応して同じ行番号へ書き込み
 """
 
 import os
 import json
-import datetime
-from typing import List, Optional, Set
+import time
+from datetime import datetime, timezone, timedelta
+from typing import List, Tuple
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from bs4 import BeautifulSoup
+import requests
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 # ===== 設定 =====
-# コピー元：Yahooニュース集計シート（固定の想定）
-SOURCE_SPREADSHEET_ID = "1RglATeTbLU1SqlfXnNToJqhXLdNoHCdePldioKDQgU8"  # ※必要なら変更
-SOURCE_SHEET_NAME = "Yahoo"  # コピー元のシート名
+SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"  # 出力先シート（固定）
+SHEET_NAME = datetime.now(timezone(timedelta(hours=9))).strftime("%y%m%d")  # JSTで当日タブ
+MAX_BODY_PAGES = 10        # 本文ページ最大
+MAX_COMMENT_PAGES = 10     # コメントページ最大
 
-# 出力先：ご指定のスプレッドシート
-DESTINATION_SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"
+REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-TZ_JST = datetime.timezone(datetime.timedelta(hours=9))
-
+# ===== 認証 =====
+def build_gspread_client() -> gspread.Client:
+    """GOOGLE_CREDENTIALS(文字列) または credentials.json から認証"""
+    try:
+        creds_str = os.environ.get("GOOGLE_CREDENTIALS")
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        if creds_str:
+            info = json.loads(creds_str)
+            credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+        else:
+            with open("credentials.json", "r", encoding="utf-8") as f:
+                info = json.load(f)
+            credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+        return gspread.authorize(credentials)
+    except Exception as e:
+        raise RuntimeError(f"Google認証に失敗: {e}")
 
 # ===== ユーティリティ =====
-def build_sheets_service():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if not creds_json:
-        raise RuntimeError(
-            "環境変数 GOOGLE_CREDENTIALS が未設定です。サービスアカウントJSONの“中身”を登録してください。"
-        )
+def ensure_sheet_and_headers(ws: gspread.Worksheet, max_comments: int) -> None:
+    """1行目にヘッダーを整備（本文列、コメント数、コメント列）"""
+    values = ws.get('A1:Z1')
+    header = values[0] if values else []
+
+    required = ["ソース","タイトル","URL","投稿日","掲載元"]
+    body_headers = [f"本文({i}ページ)" for i in range(1, 11)]  # F..O
+    comments_count_header = ["コメント数"]                       # P
+    comment_headers = [f"コメント{i}" for i in range(1, max(1, max_comments) + 1)]  # Q..
+
+    target_header = required + body_headers + comments_count_header + comment_headers
+    if header != target_header:
+        ws.update('A1', [target_header])
+
+def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
+    """記事本文（複数ページ対応）を取得"""
+    title = "取得不可"
+    article_date = "取得不可"
+    bodies: List[str] = []
+
+    for page in range(1, MAX_BODY_PAGES + 1):
+        url = base_url if page == 1 else f"{base_url}?page={page}"
+        try:
+            res = requests.get(url, headers=REQ_HEADERS, timeout=20)
+            res.raise_for_status()
+        except Exception:
+            break
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        if page == 1:
+            t = soup.find("title")
+            if t and t.get_text(strip=True):
+                title = t.get_text(strip=True).replace(" - Yahoo!ニュース", "")
+            time_tag = soup.find("time")
+            if time_tag:
+                article_date = time_tag.get_text(strip=True)
+
+        body_text = ""
+        article = soup.find("article")
+        if article:
+            ps = article.find_all("p")
+            body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
+        if not body_text:
+            main = soup.find("main")
+            if main:
+                ps = main.find_all("p")
+                body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
+
+        if not body_text or (bodies and body_text == bodies[-1]):
+            break
+
+        bodies.append(body_text)
+
+    return title, article_date, bodies
+
+def fetch_comments_with_selenium(base_url: str) -> List[str]:
+    """コメント本文をSeleniumで取得"""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    driver = webdriver.Chrome(options=options)
+    comments: List[str] = []
+
     try:
-        info = json.loads(creds_json)
-    except Exception as e:
-        raise RuntimeError(f"GOOGLE_CREDENTIALS のJSONが不正です: {e}")
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds)
+        for page in range(1, MAX_COMMENT_PAGES + 1):
+            c_url = f"{base_url}/comments?page={page}"
+            driver.get(c_url)
+            time.sleep(2)
 
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            p_candidates = []
+            p_candidates.extend(soup.find_all("p", class_="sc-169yn8p-10"))
+            p_candidates.extend(soup.select("p[data-ylk*='cm_body']"))
+            p_candidates.extend(soup.select("p[class*='comment']"))
+            page_comments = [p.get_text(strip=True) for p in p_candidates if p.get_text(strip=True)]
 
-def jst_now() -> datetime.datetime:
-    return datetime.datetime.now(TZ_JST)
+            if not page_comments:
+                break
+            if comments and page_comments and page_comments[0] == comments[-1]:
+                break
 
+            comments.extend(page_comments)
+    finally:
+        driver.quit()
 
-def parse_post_date(raw, today_jst: datetime.datetime) -> Optional[datetime.datetime]:
-    """
-    コピー元C列（投稿日）の想定値を JST の datetime に変換
-    想定:
-      - "MM/DD HH:MM" -> 年は当年補完
-      - "YYYY/MM/DD HH:MM"
-      - "YYYY/MM/DD HH:MM:SS"
-      - Excelシリアル（float, int）
-    """
-    if raw is None:
-        return None
+    return comments
 
-    # 文字列
-    if isinstance(raw, str):
-        s = raw.strip()
-        fmts = ("%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S")
-        for fmt in fmts:
-            try:
-                dt = datetime.datetime.strptime(s, fmt)
-                if fmt == "%m/%d %H:%M":
-                    dt = dt.replace(year=today_jst.year)
-                return dt.replace(tzinfo=TZ_JST)
-            except ValueError:
-                pass
-        return None
+def main():
+    print(f"📄 Spreadsheet: {SPREADSHEET_ID}")
+    print(f"📑 Sheet: {SHEET_NAME}")
 
-    # Excelシリアル（数値）
-    if isinstance(raw, (int, float)):
-        epoch = datetime.datetime(1899, 12, 30, tzinfo=TZ_JST)  # Excel起点
-        return epoch + datetime.timedelta(days=float(raw))
-
-    # 日付/日時オブジェクト
-    if isinstance(raw, datetime.datetime):
-        return raw.astimezone(TZ_JST) if raw.tzinfo else raw.replace(tzinfo=TZ_JST)
-    if isinstance(raw, datetime.date):
-        return datetime.datetime.combine(raw, datetime.time()).replace(tzinfo=TZ_JST)
-
-    return None
-
-
-def format_yy_m_d_hm(dt: datetime.datetime) -> str:
-    """
-    「yy/m/d HH:MM」に整形（先頭ゼロの月日を避ける）
-    """
-    yy = dt.strftime("%y")
-    m = str(int(dt.strftime("%m")))
-    d = str(int(dt.strftime("%d")))
-    hm = dt.strftime("%H:%M")
-    return f"{yy}/{m}/{d} {hm}"
-
-
-def ensure_destination_tab(service, spreadsheet_id: str, sheet_name: str) -> None:
-    info = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheets = info.get("sheets", [])
-    exists = any(sh["properties"]["title"] == sheet_name for sh in sheets)
-    if not exists:
-        body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
-
-
-def get_existing_urls(service, spreadsheet_id: str, sheet_name: str) -> Set[str]:
-    rng = f"'{sheet_name}'!A:E"
-    res = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    values = res.get("values", [])
-    urls = set()
-    if values:
-        # ヘッダ行がある場合にスキップ
-        start = 1 if values[0] and values[0][0] in ("ソース", "Source") else 0
-        for row in values[start:]:
-            if len(row) > 2 and row[2]:
-                urls.add(row[2])
-    return urls
-
-
-def append_rows(service, spreadsheet_id: str, sheet_name: str, rows: List[List[str]]) -> None:
-    """
-    必要に応じてヘッダを付与してから行を追加
-    """
-    rng = f"'{sheet_name}'!A1:E"
-    res = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    values = res.get("values", [])
-    need_header = not (values and values[0] and values[0][0] == "ソース")
-
-    if need_header:
-        header = [["ソース", "タイトル", "URL", "投稿日", "掲載元"]]
-        service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'!A1",
-            valueInputOption="USER_ENTERED",
-            body={"values": header},
-        ).execute()
-
-    if rows:
-        service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'!A:E",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows},
-        ).execute()
-
-
-def transfer_news():
-    service = build_sheets_service()
-
-    now = jst_now()
-    # 期間: 前日15:00〜当日14:59:59（JST）
-    start = (now - datetime.timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=14, minute=59, second=59, microsecond=0)
-    today_tab = now.strftime("%y%m%d")
-
-    print(f"出力タブ: {today_tab}")
-    print(f"期間: {start.strftime('%Y/%m/%d %H:%M:%S')} 〜 {end.strftime('%Y/%m/%d %H:%M:%S')}")
-
-    # 出力先準備
-    ensure_destination_tab(service, DESTINATION_SPREADSHEET_ID, today_tab)
-    existing = get_existing_urls(service, DESTINATION_SPREADSHEET_ID, today_tab)
-    print(f"既存URL: {len(existing)} 件")
-
-    # コピー元取得
-    src_range = f"'{SOURCE_SHEET_NAME}'!A:D"
+    gc = build_gspread_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
     try:
-        resp = service.spreadsheets().values().get(
-            spreadsheetId=SOURCE_SPREADSHEET_ID, range=src_range
-        ).execute()
-        rows = resp.get("values", [])
-    except HttpError as e:
-        print(f"エラー: コピー元シート取得失敗: {e}")
-        rows = []
+        ws = sh.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_NAME, rows="2000", cols="200")
 
-    # 収集
-    out_rows: List[List[str]] = []
-    if rows:
-        # 1行目はヘッダ想定: A=タイトル, B=URL, C=投稿日, D=掲載元
-        for i, r in enumerate(rows):
-            if i == 0:
-                continue
-            title = r[0].strip() if len(r) > 0 and r[0] else ""
-            url = r[1].strip() if len(r) > 1 and r[1] else ""
-            posted_raw = r[2] if len(r) > 2 else ""
-            source_site = r[3].strip() if len(r) > 3 and r[3] else ""
+    urls = ws.col_values(3)[1:]
+    total = len(urls)
+    print(f"🔎 URLs to process: {total}")
+    if total == 0:
+        print("URLがありません。終了します。")
+        return
 
-            if not title or not url:
-                continue
+    rows_data: List[List[str]] = []
+    max_comments = 0
 
-            dt = parse_post_date(posted_raw, now)
-            if not dt:
-                continue
-            if not (start <= dt <= end):
-                continue
-            if url in existing:
-                continue
+    for idx, url in enumerate(urls, start=2):
+        try:
+            print(f"  - ({idx-1}/{total}) {url}")
+            title, article_date, bodies = fetch_article_pages(url)
+            comments = fetch_comments_with_selenium(url)
 
-            out_rows.append(
-                ["Yahoo", title, url, format_yy_m_d_hm(dt), source_site]
-            )
+            body_cells = bodies[:MAX_BODY_PAGES] + [""] * (MAX_BODY_PAGES - len(bodies))
+            comment_count = len(comments)
+            row = body_cells + [comment_count] + comments
+            rows_data.append(row)
+            if comment_count > max_comments:
+                max_comments = comment_count
+        except Exception as e:
+            print(f"    ! Error: {e}")
+            row = ([""] * MAX_BODY_PAGES) + [0]
+            rows_data.append(row)
 
-    if out_rows:
-        append_rows(service, DESTINATION_SPREADSHEET_ID, today_tab, out_rows)
-        print(f"新規 {len(out_rows)} 件を追加")
-    else:
-        print("新規追加なし")
+    need_cols = MAX_BODY_PAGES + 1 + max_comments
+    for i in range(len(rows_data)):
+        if len(rows_data[i]) < need_cols:
+            rows_data[i].extend([""] * (need_cols - len(rows_data[i])))
 
+    ensure_sheet_and_headers(ws, max_comments=max_comments)
+    ws.update("F2", rows_data)
+    print(f"✅ 書き込み完了: {len(rows_data)}行 / コメント列={max_comments}")
 
 if __name__ == "__main__":
-    transfer_news()
+    main()
