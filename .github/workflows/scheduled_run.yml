@@ -19,22 +19,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 🧰 Install Chrome & Chromedriver
+      # ✅ Google Chrome だけ入れる（Chromedriverは不要）
+      - name: 🧰 Install Google Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y wget unzip xvfb libxi6 curl
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt -f install -y
-          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
-          MAJOR_VERSION=$(echo $CHROME_VERSION | cut -d '.' -f 1)
-          DRIVER_URL="https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${MAJOR_VERSION}"
-          DRIVER_VERSION=$(curl -s $DRIVER_URL)
-          wget "https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/chromedriver_linux64.zip"
-          unzip -o chromedriver_linux64.zip
-          chmod +x chromedriver
-          sudo mv -f chromedriver /usr/local/bin/chromedriver
-          which chromedriver
-          chromedriver --version
+          google-chrome --version
 
       - name: 📦 Install dependencies
         run: |
