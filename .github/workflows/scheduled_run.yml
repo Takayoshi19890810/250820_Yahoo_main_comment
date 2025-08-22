@@ -1,26 +1,27 @@
-name: "Yahoo News - Transfer A-E then scrape article bodies & comments"
+name: Yahoo News Scraper
 
 on:
+  workflow_dispatch: {}          # 手動実行ボタンに必須
   schedule:
-    # 毎日 15:10 JST（= 06:10 UTC）
-    - cron: "10 6 * * *"
-  workflow_dispatch:
+    - cron: '10 6 * * *'         # JST 15:10（UTC 06:10）
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - name: "📥 Checkout"
+      - name: 📅 Check out repository
         uses: actions/checkout@v4
 
-      - name: "🐍 Set up Python"
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      # ✅ Google Chrome だけ入れる（Chromedriverは不要：Selenium Managerが自動解決）
-      - name: "🧰 Install Google Chrome"
+      # SeleniumでYahooコメント取得を使う場合はChromeが必要
+      - name: 🧰 Install Google Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y wget unzip xvfb libxi6 curl
@@ -28,12 +29,12 @@ jobs:
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt -f install -y
           google-chrome --version
 
-      - name: "📦 Install dependencies"
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: "▶️ Run unified job"
+      - name: ▶️ Run script
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: |
