@@ -1,35 +1,45 @@
 name: Yahoo News Scraper
 
 on:
-  workflow_dispatch: {}          # 手動実行ボタンに必須
+  workflow_dispatch: {}            # 手動実行
   schedule:
-    - cron: '10 6 * * *'         # JST 15:10（UTC 06:10）
+    # 15:10 JST == 06:10 UTC
+    - cron: '10 6 * * *'
+
+permissions:
+  contents: read
 
 jobs:
   run:
+    name: Run scraper
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Chrome
+      - name: Install system deps (Chrome)
         run: |
           sudo apt-get update
           sudo apt-get install -y wget unzip xvfb libxi6 curl
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt -f install -y
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -f install -y
           google-chrome --version
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run
+      - name: Run main.py
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-        run: python main.py
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}   # サービスアカウントJSONの“中身”
+        run: |
+          python main.py
