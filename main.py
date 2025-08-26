@@ -39,9 +39,11 @@ SOURCE_SHEET_NAME = "Yahoo"  # A:タイトル / B:URL / C:投稿日 / D:掲載�
 DEST_SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"
 
 # 本文・コメント取得設定
-MAX_BODY_PAGES = 10
-MAX_COMMENT_PAGES = 10
+MAX_BODY_PAGES = 10  # 本文ページ上限は従来通り（Yahoo本文は多くても数ページ想定）
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# コメントの安全上限（無限スクレイプ暴走防止）。必要なら変更可。
+MAX_TOTAL_COMMENTS = 5000
 
 TZ_JST = timezone(timedelta(hours=9))
 
@@ -203,8 +205,13 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
         bodies.append(body_text)
     return title, article_date, bodies
 
-# ====== コメント取得（Selenium Manager 使用） ======
+# ====== コメント取得（全ページ・全件） ======
 def fetch_comments_with_selenium(base_url: str) -> List[str]:
+    """
+    Yahoo!ニュースのコメントを /comments?page=1 ... で全ページ巡回して全件取得。
+    空ページに達するか、前後ページで重複（同一境界）を検知したら終了。
+    暴走防止に MAX_TOTAL_COMMENTS を超えたら打ち切り。
+    """
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -212,25 +219,59 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,2000")
     driver = webdriver.Chrome(options=options)  # Selenium Manager が自動でDriver解決
+
     comments: List[str] = []
+    last_tail: Optional[str] = None
+    page = 1
     try:
-        for page in range(1, MAX_COMMENT_PAGES + 1):
+        while True:
             c_url = f"{base_url}/comments?page={page}"
             driver.get(c_url)
-            time.sleep(2)
+            # 軽い待機（必要に応じて調整）
+            time.sleep(2.0)
+
             soup = BeautifulSoup(driver.page_source, "html.parser")
+
+            # できるだけ堅牢なセレクタ群（将来変化に備えて複数併用）
+            selectors = [
+                "p.sc-169yn8p-10",                       # 既存
+                "p[data-ylk*='cm_body']",                # 既存
+                "p[class*='comment']",                    # 既存
+                "div.commentBody, p.commentBody",        # 汎用
+                "div[data-ylk*='cm_body']"               # 汎用
+            ]
+
             p_candidates = []
-            p_candidates.extend(soup.find_all("p", class_="sc-169yn8p-10"))
-            p_candidates.extend(soup.select("p[data-ylk*='cm_body']"))
-            p_candidates.extend(soup.select("p[class*='comment']"))
+            for sel in selectors:
+                p_candidates.extend(soup.select(sel))
+
             page_comments = [p.get_text(strip=True) for p in p_candidates if p.get_text(strip=True)]
+            # 重複除去（同一ページ内の重複）
+            page_comments = list(dict.fromkeys(page_comments))
+
+            # 空ページなら終了
             if not page_comments:
                 break
-            if comments and page_comments and page_comments[0] == comments[-1]:
+
+            # 前ページ末尾と今ページ先頭が同じなら終了（巡回終了のシンプル判定）
+            if last_tail is not None and page_comments and page_comments[0] == last_tail:
                 break
+
+            # 蓄積
             comments.extend(page_comments)
+
+            # 安全上限で打ち切り
+            if len(comments) >= MAX_TOTAL_COMMENTS:
+                comments = comments[:MAX_TOTAL_COMMENTS]
+                break
+
+            # 次ページへ
+            last_tail = page_comments[-1]
+            page += 1
+
     finally:
         driver.quit()
+
     return comments
 
 # ====== 本文＆コメントを書き込み ======
@@ -248,6 +289,7 @@ def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
             print(f"  - ({idx-1}/{total}) {url}")
             _title, _date, bodies = fetch_article_pages(url)
             comments = fetch_comments_with_selenium(url)
+
             body_cells = bodies[:MAX_BODY_PAGES] + [""] * (MAX_BODY_PAGES - len(bodies))
             cnt = len(comments)
             row = body_cells + [cnt] + comments
@@ -270,7 +312,7 @@ def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
     # F2 から一括更新
     if rows_data:
         ws.update("F2", rows_data)
-        print(f"✅ 本文・コメントを書き込み: {len(rows_data)} 行（コメント列={max_comments}）")
+        print(f"✅ 本文・コメントを書き込み: {len(rows_data)} 行（最大コメント列={max_comments}）")
 
 # ====== メイン ======
 def main():
