@@ -6,7 +6,7 @@
 2) 出力先（当日タブ yyMMdd）へ A〜E列として追記
    A:ソース("Yahoo") / B:タイトル / C:URL / D:投稿日(yy/m/d HH:MM) / E:掲載元
    - URL重複は当日タブ内でスキップ
-3) その当日タブの C列URLを起点に、本文（最大10ページ）を F..O、コメント数を P、コメント本文を Q.. に追記
+3) その当日タブの C列URLを起点に、本文（最大10ページ）を F..O、コメント数を P、コメント(JSON)を Q に追記
 
 認証:
 - GitHub Secrets: GOOGLE_CREDENTIALS（サービスアカウントJSONの“中身”）
@@ -39,10 +39,10 @@ SOURCE_SHEET_NAME = "Yahoo"  # A:タイトル / B:URL / C:投稿日 / D:掲載�
 DEST_SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"
 
 # 本文・コメント取得設定
-MAX_BODY_PAGES = 10  # 本文ページ上限は従来通り（Yahoo本文は多くても数ページ想定）
+MAX_BODY_PAGES = 10  # 本文ページ上限
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# コメントの安全上限（無限スクレイプ暴走防止）。必要なら変更可。
+# コメントの安全上限（無限スクレイプ暴走防止）
 MAX_TOTAL_COMMENTS = 5000
 
 TZ_JST = timezone(timedelta(hours=9))
@@ -103,10 +103,13 @@ def build_gspread_client() -> gspread.Client:
 
 # ====== 出力先タブ操作 ======
 def ensure_today_sheet(sh: gspread.Spreadsheet, today_tab: str) -> gspread.Worksheet:
+    """
+    ※ セル上限対策：rows/cols を縮小（300行×30列）
+    """
     try:
         ws = sh.worksheet(today_tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=today_tab, rows="3000", cols="300")
+        ws = sh.add_worksheet(title=today_tab, rows="300", cols="30")
     return ws
 
 def get_existing_urls(ws: gspread.Worksheet) -> Set[str]:
@@ -117,19 +120,20 @@ def ensure_ae_header(ws: gspread.Worksheet) -> None:
     # A:ソース / B:タイトル / C:URL / D:投稿日 / E:掲載元
     head = ws.row_values(1)
     target = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
-    if head != target:
+    if head[:5] != target:
         ws.update('A1', [target])
 
-def ensure_body_comment_headers(ws: gspread.Worksheet, max_comments: int) -> None:
+def ensure_body_comment_headers(ws: gspread.Worksheet) -> None:
     """
-    1行目に F..O(本文1〜10), P(コメント数), Q..(コメント1〜N) を整える
+    1行目に F..O(本文1〜10), P(コメント数), Q(コメントJSON) を整える
     """
-    current = ws.row_values(1)
     base = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
     body_headers = [f"本文({i}ページ)" for i in range(1, 11)]  # F..O
-    comments_count = ["コメント数"]  # P
-    comment_headers = [f"コメント{i}" for i in range(1, max(1, max_comments) + 1)]  # Q..
-    target = base + body_headers + comments_count + comment_headers
+    tail = ["コメント数", "コメント(JSON)"]  # P, Q
+    target = base + body_headers + tail
+
+    current = ws.row_values(1)
+    # 必要ならA1から上書き
     if current != target:
         ws.update('A1', [target])
 
@@ -234,11 +238,11 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
 
             # できるだけ堅牢なセレクタ群（将来変化に備えて複数併用）
             selectors = [
-                "p.sc-169yn8p-10",                       # 既存
-                "p[data-ylk*='cm_body']",                # 既存
-                "p[class*='comment']",                    # 既存
-                "div.commentBody, p.commentBody",        # 汎用
-                "div[data-ylk*='cm_body']"               # 汎用
+                "p.sc-169yn8p-10",
+                "p[data-ylk*='cm_body']",
+                "p[class*='comment']",
+                "div.commentBody, p.commentBody",
+                "div[data-ylk*='cm_body']"
             ]
 
             p_candidates = []
@@ -276,6 +280,9 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
 
 # ====== 本文＆コメントを書き込み ======
 def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
+    """
+    F..O(本文1〜10), P(コメント数), Q(コメントJSON) を一括更新
+    """
     urls = ws.col_values(3)[1:]  # C列URL（2行目以降）
     total = len(urls)
     print(f"🔎 URLs to process: {total}")
@@ -283,36 +290,39 @@ def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
         return
 
     rows_data: List[List[str]] = []
-    max_comments = 0
     for idx, url in enumerate(urls, start=2):
         try:
             print(f"  - ({idx-1}/{total}) {url}")
             _title, _date, bodies = fetch_article_pages(url)
             comments = fetch_comments_with_selenium(url)
 
+            # 本文セル（最大 MAX_BODY_PAGES にフィット）
             body_cells = bodies[:MAX_BODY_PAGES] + [""] * (MAX_BODY_PAGES - len(bodies))
+
+            # コメントは JSON 文字列にまとめて 1セルへ
+            json_comments = json.dumps(comments, ensure_ascii=False)
             cnt = len(comments)
-            row = body_cells + [cnt] + comments
+
+            # 行データ: [本文x10, コメント数, コメントJSON]
+            row = body_cells + [cnt, json_comments]
             rows_data.append(row)
-            if cnt > max_comments:
-                max_comments = cnt
         except Exception as e:
             print(f"    ! Error: {e}")
-            rows_data.append(([""] * MAX_BODY_PAGES) + [0])
+            rows_data.append(([""] * MAX_BODY_PAGES) + [0, "[]"])
 
-    # 列幅を最大コメント数に
-    need_cols = MAX_BODY_PAGES + 1 + max_comments
+    # 必要列数（本文10 + コメント数1 + コメントJSON1 = 12列）
+    need_cols = MAX_BODY_PAGES + 2
     for i in range(len(rows_data)):
         if len(rows_data[i]) < need_cols:
             rows_data[i].extend([""] * (need_cols - len(rows_data[i])))
 
     # ヘッダー整備（本文とコメントの列を含む完全版）
-    ensure_body_comment_headers(ws, max_comments=max_comments)
+    ensure_body_comment_headers(ws)
 
-    # F2 から一括更新
+    # F2 から一括更新（F..Q）
     if rows_data:
         ws.update("F2", rows_data)
-        print(f"✅ 本文・コメントを書き込み: {len(rows_data)} 行（最大コメント列={max_comments}）")
+        print(f"✅ 本文・コメント(JSON)を書き込み: {len(rows_data)} 行")
 
 # ====== メイン ======
 def main():
@@ -326,7 +336,7 @@ def main():
     added = transfer_a_to_e(gc, ws)
     print(f"📝 A〜E 追記: {added} 行")
 
-    # 2) F以降（本文＆コメント）を埋める
+    # 2) F以降（本文＆コメントJSON）を埋める
     write_bodies_and_comments(ws)
 
 if __name__ == "__main__":
